@@ -54,7 +54,7 @@ def main() -> None:
         {
             "id": 1,
             "vector": [1.0, 0.0, 0.0, 0.0],
-            "payload": {"question": "kpi nima?", "answer": "KPI — samaradorlik ko‘rsatkichlari"},
+            "payload": {"question": "kpiss nima?", "answer": "KPI — samaradorlik ko‘rsatkichlari"},
         },
         {
             "id": 2,
