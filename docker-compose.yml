@@ -1,4 +1,5 @@
 services:
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant_playground
@@ -7,6 +8,17 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
+
+  api:
+    build: .
+    container_name: fastapi_mvp_api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 volumes:
   qdrant_data:
