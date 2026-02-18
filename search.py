@@ -30,11 +30,7 @@ class OpenRouterEmbedder:
 
 class QdrantSemanticSearch:
     """
-    Qidiruv sifatini yaxshilangan variant:
-      - limit=1 emas, top_k oladi
-      - boilerplate (footer/menu/telefon) bo‘laklarni penalize/skip qiladi
-      - score_threshold qo‘llaydi
-      - qaytaradigan text payload ichidan text_key orqali olinadi
+    Top-K natijalarni olish + kontekst yig‘ish.
     """
 
     def __init__(
@@ -49,68 +45,35 @@ class QdrantSemanticSearch:
         self.embedder = embedder
         self.text_key = text_key
 
-        # UI/footerdan keladigan shovqinlarni aniqlash uchun patternlar
-        self._bad_substrings = [
-            "Barcha huquqlar",
-            "©",
-            "SOFF CRM",
-            "Demo olish",
-            "Qo'ng'iroq",
-            "Narxlarni ko'rish",
-            "Bizning hamjamiyatimizga qo'shiling",
-            "Kontakt",
-            "Biz haqimizda",
-            "Bosh sahifa",
-        ]
-        self._phone_re = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")  # telefon
-        self._only_short_tokens_re = re.compile(r"^(\W*\w{1,3}\W*){1,6}$")
-
-    def _is_boilerplate(self, text: str) -> bool:
-        if not text:
-            return True
-
-        t = text.strip()
-
-        # juda qisqa / menu ko‘rinishida bo‘lsa
-        if len(t) < 60:
-            return True
-
-        # telefon raqam ko‘p bo‘lsa
-        if self._phone_re.search(t):
-            return True
-
-        # ko‘p shovqinli substringlar bo‘lsa
-        low = t.lower()
-        for s in self._bad_substrings:
-            if s.lower() in low:
-                return True
-
-        # juda "menyu" ko‘rinishida (faqat qisqa tokenlar)
-        if self._only_short_tokens_re.match(t.replace("\n", " ")):
-            return True
-
-        return False
+        self._phone_re = re.compile(r"\+?\d[\d\s\-\(\)]{7,}\d")
 
     def _extract_text(self, payload: Dict[str, Any]) -> str:
-        # afzal: text_key
-        val = payload.get(self.text_key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+        v = payload.get(self.text_key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
-        # fallback lar
         for k in ("clean_text", "text", "body", "answer", "question"):
-            v = payload.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-
+            vv = payload.get(k)
+            if isinstance(vv, str) and vv.strip():
+                return vv.strip()
         return ""
 
-    def ask(
-            self,
-            question: str,
-            *,
-            top_k: int = 10,
-            score_threshold: Optional[float] = None,  # default: o‘chirilgan
+    def _is_noise(self, text: str) -> bool:
+        if not text:
+            return True
+        t = text.strip()
+        if len(t) < 40:
+            return True
+        if self._phone_re.search(t):
+            return True
+        return False
+
+    def ask_many(
+        self,
+        question: str,
+        *,
+        top_k: int = 12,
+        score_threshold: Optional[float] = None,
     ) -> Dict[str, Any]:
         vector = self.embedder.embed(question)
 
@@ -122,36 +85,108 @@ class QdrantSemanticSearch:
             with_vectors=False,
         )
 
-        if not res.points:
-            return {"found": False, "text": None, "score": None, "payload": None}
-
-        best = None
-        best_score = -1e9
-
-        for p in res.points:
-            score = float(p.score) if p.score is not None else 0.0
-            if score_threshold is not None and score < score_threshold:
-                continue
-
+        items: List[Dict[str, Any]] = []
+        for p in res.points or []:
             payload = p.payload or {}
             text = self._extract_text(payload)
-            if not text:
+            score = float(p.score) if p.score is not None else None
+
+            if score_threshold is not None and score is not None and score < score_threshold:
                 continue
 
-            # penalti: boilerplate bo‘lsa biroz kamaytiramiz, lekin tashlab yubormaymiz
-            penalized = score - (0.10 if self._is_boilerplate(text) else 0.0)
+            items.append(
+                {
+                    "id": p.id,
+                    "score": score,
+                    "text": text,
+                    "payload": payload,
+                }
+            )
 
-            if penalized > best_score:
-                best_score = penalized
-                best = (text, score, payload)
+        return {"found": len(items) > 0, "matches": items}
 
-        # agar filtrlar sababli hech narsa tanlanmasa, baribir top1 qaytaramiz
-        if best is None:
-            p0 = res.points[0]
-            payload0 = p0.payload or {}
-            text0 = self._extract_text(payload0)
-            score0 = float(p0.score) if p0.score is not None else None
-            return {"found": True, "text": text0, "score": score0, "payload": payload0}
+    def answer_text(
+        self,
+        matches: List[Dict[str, Any]],
+        *,
+        max_chars: int = 1800,
+        max_chunks: int = 6,
+    ) -> str:
+        """
+        Top-K natijadan foydali bo‘laklarni yig‘ib kontekst qiladi.
+        Noise bo‘laklarni tashlab ketadi, lekin hammasi noise bo‘lsa baribir qaytaradi.
+        """
+        if not matches:
+            return ""
 
-        text, score, payload = best
-        return {"found": True, "text": text, "score": score, "payload": payload}
+        # score bo‘yicha sort (katta -> kichik)
+        matches = sorted(matches, key=lambda x: (x["score"] or 0.0), reverse=True)
+
+        selected: List[str] = []
+        total = 0
+
+        # 1) avval noise bo‘lmaganlarini olamiz
+        for m in matches:
+            t = (m.get("text") or "").strip()
+            if not t or self._is_noise(t):
+                continue
+            if t in selected:
+                continue
+
+            if total + len(t) > max_chars:
+                remaining = max_chars - total
+                if remaining > 120:
+                    selected.append(t[:remaining])
+                break
+
+            selected.append(t)
+            total += len(t)
+            if len(selected) >= max_chunks:
+                break
+
+        # 2) agar hammasi noise bo‘lib qolsa, top1 ni qaytarib yuboramiz
+        if not selected:
+            t = (matches[0].get("text") or "").strip()
+            return t[:max_chars]
+
+        return "\n\n---\n\n".join(selected)
+
+
+"""
+FASTAPI endpoint misol:
+
+from fastapi import APIRouter
+from pydantic import BaseModel
+from decouple import config
+
+router = APIRouter()
+
+API_KEY = config("OPENROUTER_API_KEY")
+QDRANT_URL = config("QDRANT_URL", default="http://localhost:6333")
+
+embedder = OpenRouterEmbedder(api_key=API_KEY, model="text-embedding-3-small")
+searcher = QdrantSemanticSearch(
+    qdrant_url=QDRANT_URL,
+    collection="play_kb",
+    embedder=embedder,
+    text_key="text",
+)
+
+class QuestionResponse(BaseModel):
+    question: str
+
+class AnswerResponse(BaseModel):
+    answer: str
+    status: str
+    matches: list  # debug uchun (xohlasang olib tashla)
+
+@router.post("/question/", response_model=AnswerResponse)
+async def question_api(body: QuestionResponse):
+    res = searcher.ask_many(body.question, top_k=12, score_threshold=None)
+    context = searcher.answer_text(res["matches"], max_chars=1800, max_chunks=6)
+
+    if not context:
+        return {"answer": "Topilmadi.", "status": "ok", "matches": []}
+
+    return {"answer": context, "status": "ok", "matches": res["matches"][:5]}
+"""
