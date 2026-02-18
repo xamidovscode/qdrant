@@ -144,8 +144,10 @@ if __name__ == "__main__":
         data = json.load(f)
 
     embedder = OpenRouterEmbedder(api_key=API_KEY, model="text-embedding-3-small")
-    qdrant = QdrantService(url="http://localhost:6333", collection="soffcrm")
-
+    qdrant = QdrantService(
+        url=config("QDRANT_URL", default="http://qdrant:6333"),
+        collection="play_kb"
+    )
     inserted = insert_pages_json_to_qdrant(
         data=data,
         embedder=embedder,
