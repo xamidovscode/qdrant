@@ -1,4 +1,3 @@
-# config.py
-QDRANT_URL = "http://localhost:6333"
+QDRANT_URL = "http://46.62.222.172:6333/:6333"
 COLLECTION = "main_test"
 VECTOR_SIZE = 1536
